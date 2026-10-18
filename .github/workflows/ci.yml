@@ -77,7 +77,7 @@ jobs:
       - name: cargo test (configured)
         working-directory: integrations/aomi-audit
         run: |
-          sed 's/"enabled": false/"enabled": true/; s/<RECEIPT_REGISTRY_V2_ADDRESS>/0x4444444444444444444444444444444444444444/; s/<AUDITOR_WALLET_ADDRESS>/0x5555555555555555555555555555555555555555/' \
+          sed 's/"enabled": false/"enabled": true/; s/<AUDITOR_WALLET_ADDRESS>/0x5555555555555555555555555555555555555555/' \
             audit-deployment.example.json > "$RUNNER_TEMP/audit.json"
           RR_AUDIT_CONFIG="$RUNNER_TEMP/audit.json" cargo test --locked
 

@@ -75,7 +75,8 @@ fully excluded.
 ## Configure for live testing
 
 1. Copy `audit-deployment.example.json` to `audit-deployment.json` (ignored by git), set the
-   `ReceiptRegistryV2` address and the auditor wallet, and set `enabled` to `true`.
+   auditor wallet, and set `enabled` to `true`. The example already points at the live
+   `ReceiptRegistryV2` on Arc testnet (`0x27d93c52…c4c1`); `publishV2` is permissionless.
 2. On the API, set `RR_AUDIT_CONFIG` to that file, `RR_AUDIT_RPC_URL` to an Arc testnet RPC
    that supports the `finalized` block tag, and `RR_AUDIT_API_TOKEN` to a random token.
 3. On the oracle loop, set `RR_AUDIT_MODE=aomi` (with `RR_USE_ENSEMBLE=1`).
