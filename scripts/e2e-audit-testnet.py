@@ -37,6 +37,7 @@ from pathlib import Path
 import httpx
 from eth_abi import decode as abi_decode
 from eth_account import Account
+from eth_utils import to_checksum_address
 
 REGISTRY = os.getenv("RR_E2E_REGISTRY", "0x27d93c52fea923f956345af27f61d7bf47f0c4c1").lower()
 CHAIN_ID = 5042002
@@ -48,7 +49,8 @@ for name in ("GOOGLE_API_KEY", "IRYS_PRIVATE_KEY", "RR_AUDITOR_ARC_TESTNET_PRIVA
     if not os.getenv(name):
         sys.exit(f"missing {name}")
 auditor = Account.from_key(os.environ["RR_AUDITOR_ARC_TESTNET_PRIVATE_KEY"])
-work = Path(tempfile.mkdtemp(prefix="rr-e2e-"))
+# RR_E2E_WORK reuses an earlier run's database, so a sealed audit can be published without re-running the oracle.
+work = Path(os.getenv("RR_E2E_WORK") or tempfile.mkdtemp(prefix="rr-e2e-"))
 (work / "audit.json").write_text(
     json.dumps(
         {"enabled": True, "chain_id": CHAIN_ID, "registry": REGISTRY, "auditor": auditor.address.lower()}
@@ -210,7 +212,7 @@ def publish(sealed: dict) -> str:
     nonce = int(rpc("eth_getTransactionCount", [auditor.address, "pending"])["result"], 16)
     signed = auditor.sign_transaction(
         {
-            "to": REGISTRY,
+            "to": to_checksum_address(REGISTRY),
             "data": data,
             "value": 0,
             "chainId": CHAIN_ID,
@@ -231,13 +233,18 @@ async def main() -> None:
     step(f"auditor {auditor.address}, registry {REGISTRY}, rpc {RPC}")
     assert rpc("eth_chainId", [])["result"] == hex(CHAIN_ID), "RPC is not Arc testnet"
 
-    step("1/5 oracle: Gemini reasons over live markets (audit mode: no upload, no publish)")
-    await AgentLoop().run_once()
     pending = api.get("/v1/audits/next", headers=AUTH).json()
-    if pending.get("status") != "pending":
+    if pending.get("status") == "sealed":
+        step(f"resuming sealed audit #{pending['audit_id']}; the oracle is not re-run")
+    else:
+        step("1/5 oracle: Gemini reasons over live markets (audit mode: no upload, no publish)")
+        await AgentLoop().run_once()
+        pending = api.get("/v1/audits/next", headers=AUTH).json()
+    if pending.get("status") not in ("pending", "sealed"):
         sys.exit(f"the oracle handed off nothing to audit: {pending}")
 
-    while pending.get("status") == "pending":
+    sealed = pending
+    while sealed.get("status") != "sealed":
         audit_id = pending["audit_id"]
         step(f"2/5 audit #{audit_id}: {pending['market_question']} (claim {pending['claim']})")
         sources = []
@@ -265,8 +272,8 @@ async def main() -> None:
             break
         step(f"   rejected, nothing published: {sealed.get('reasons') or sealed}")
         pending = api.get("/v1/audits/next", headers=AUTH).json()
-    else:
-        sys.exit("every audit was rejected; nothing was published (that is the correct outcome for them)")
+        if pending.get("status") != "pending":
+            sys.exit("every audit was rejected; nothing was published (that is the correct outcome for them)")
 
     step(
         f"   sealed: trace_hash {sealed['trace_hash']} root {sealed['merkle_root']} cid {sealed['trace_cid']}"
