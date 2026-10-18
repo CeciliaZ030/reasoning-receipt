@@ -72,6 +72,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fastapi.testclient import TestClient  # noqa: E402
 from google import genai  # noqa: E402
+from google.genai import errors as genai_errors  # noqa: E402
 
 from agent.loop import AgentLoop  # noqa: E402
 from server.main import app  # noqa: E402
@@ -168,9 +169,18 @@ def judge(question: str, claim: dict, evidence: dict, excerpt: str) -> tuple[boo
         f"Fetched page excerpt:\n<<<\n{excerpt}\n>>>\n"
         'Answer with JSON only: {"supports": true|false, "note": "<one short line>"}'
     )
-    out = gemini.models.generate_content(
-        model=os.getenv("RR_E2E_JUDGE_MODEL", "gemini-2.5-flash"), contents=prompt
-    )
+    # Free-tier keys allow a handful of requests per minute: wait out a 429 rather than abort the run.
+    for attempt in range(4):
+        try:
+            out = gemini.models.generate_content(
+                model=os.getenv("RR_E2E_JUDGE_MODEL", "gemini-2.5-flash"), contents=prompt
+            )
+            break
+        except genai_errors.ClientError as exc:
+            if exc.code != 429 or attempt == 3:
+                raise
+            step("   judge rate-limited, waiting 60s")
+            time.sleep(60)
     verdict = json.loads(re.search(r"\{.*\}", out.text, re.S).group(0))
     return bool(verdict["supports"]), str(verdict.get("note", ""))[:200]
 
