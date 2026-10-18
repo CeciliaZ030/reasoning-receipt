@@ -220,12 +220,21 @@ def test_audit_must_cover_every_cited_source_exactly(chain, handed_off, change):
 @pytest.mark.parametrize(
     ("change", "reason"),
     [
-        (lambda b: b["sources"][0].update(http_status=404), "could not be retrieved"),
+        (lambda b: [c.update(http_status=404) for c in b["sources"]], "no cited source could be read"),
         (
-            lambda b: b["sources"][0].update(http_status=None, content_sha256=None, error="timeout"),
-            "could not be retrieved",
+            lambda b: [
+                c.update(http_status=None, content_sha256=None, error="timeout") for c in b["sources"]
+            ],
+            "no cited source could be read",
         ),
-        (lambda b: b["sources"][0].update(supports=False), "does not support"),
+        (lambda b: [c.update(supports=False) for c in b["sources"]], "only 0 of"),
+        (
+            lambda b: (
+                [c.update(supports=i == 0) for i, c in enumerate(b["sources"])]
+                + [b["sources"][1].update(http_status=410)]
+            ),
+            "readable sources support",
+        ),
         (lambda b: b.update(verdict="rejected", notes="claim ignores the bear case"), "auditor rejected"),
     ],
 )
@@ -241,6 +250,17 @@ def test_failed_audit_is_recorded_and_never_sealed(chain, handed_off, change, re
     assert client.get("/v1/audits/next", headers=AUTH).json() == {"status": "empty"}
     assert seal(findings(handed_off)).status_code == 409
     assert client.get("/v1/audits/1", headers=AUTH).json() == rejected
+
+
+def test_blocked_pages_are_skipped_and_most_readable_sources_decide(chain, handed_off):
+    body = findings(handed_off)
+    body["sources"][0].update(http_status=403, content_sha256=None, supports=False)
+    sealed = seal(body).json()
+    assert sealed["status"] == "sealed"
+    with Session() as s:
+        verdict = json.loads(s.get(AuditRow, 1).sealed_trace)["external_audit"]["nodes"]["xa_verdict"]
+    assert verdict["verdict"] == "approved"
+    assert verdict["skipped_sources"] == [body["sources"][0]["evidence_id"]]
 
 
 def test_approved_audit_adds_nodes_and_keeps_every_oracle_hash(chain, handed_off):

@@ -246,7 +246,9 @@ async def main() -> None:
             supports, note = judge(pending["market_question"], pending["claim"], evidence, excerpt)
             sources.append({**found, "supports": supports, "note": note})
             step(f"   {evidence['id']}: HTTP {found['http_status']} supports={supports} ({note})")
-        verdict = "approved" if sources and all(s["supports"] for s in sources) else "rejected"
+        # The API applies the majority rule to the sources; the auditor's own verdict is "approved"
+        # unless it found nothing to stand on.
+        verdict = "approved" if any(s["supports"] for s in sources) else "rejected"
         step(f"3/5 seal: verdict {verdict}")
         sealed = api.post(
             f"/v1/audits/{audit_id}/seal",

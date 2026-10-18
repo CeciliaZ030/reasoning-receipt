@@ -334,7 +334,7 @@ pub struct Judgment {
 pub struct SealArgs {
     /// audit_id from rr_next_audit.
     pub audit_id: u64,
-    /// approved only if every source supports its citation and the claim follows from the evidence.
+    /// approved only if the claim follows from the sources that could be read; the API also requires most of them to support it.
     pub verdict: Verdict,
     /// Why, in a few sentences. Stored in the published trace.
     pub notes: String,

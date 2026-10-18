@@ -9,9 +9,9 @@
    mention the figure does not support it. The title match is a hint, not proof.
 3. Judge the trace as a whole: does the claim and its probability follow from the
    stances and evidence, and are counter-arguments addressed? Then call rr_seal_audit
-   with one judgment per source, a verdict and short notes. Approve only if every
-   source supports its citation and the reasoning holds. The API rejects the audit
-   anyway if any source was not retrieved or not supported.
+   with one judgment per source, a verdict and short notes. Approve only if the
+   reasoning holds on the sources you could read. The API skips pages that refused
+   the fetch and rejects the audit unless most of the remaining sources support it.
 4. rejected: say why; nothing is published, and the next trace can be audited.
    sealed: follow the stage_tx route byte for byte. The host simulates it right away.
    If simulation fails, stop: nothing may be published.
