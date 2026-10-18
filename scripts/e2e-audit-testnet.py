@@ -22,10 +22,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html
+import ipaddress
 import json
 import os
 import re
 import secrets
+import socket
 import sys
 import tempfile
 import time
@@ -104,20 +106,48 @@ def check_source(evidence: dict) -> tuple[dict, str]:
         "error": None,
     }
     try:
-        r = httpx.get(
-            evidence["url"], follow_redirects=True, timeout=15, headers={"User-Agent": "rr-aomi-audit/0.1"}
-        )
-        body = r.content[: 2 * 1024 * 1024]
+        # Same rules as the app's public_https: https only, a named host that resolves
+        # to public addresses only, every redirect target checked, at most five hops.
+        url, body = httpx.URL(evidence["url"]), b""
+        for _ in range(6):
+            host = url.host
+            try:
+                ipaddress.ip_address(host)
+                literal = True
+            except ValueError:
+                literal = False
+            try:
+                addrs = (
+                    {ipaddress.ip_address(a[4][0]) for a in socket.getaddrinfo(host, 443)} if host else set()
+                )
+            except OSError:
+                addrs = set()
+            if url.scheme != "https" or literal or not addrs or not all(a.is_global for a in addrs):
+                result["error"] = "not a public https URL"
+                return result, ""
+            with httpx.stream("GET", url, timeout=15, headers={"User-Agent": "rr-aomi-audit/0.1"}) as r:
+                if r.is_redirect:
+                    url = r.next_request.url
+                    continue
+                for chunk in r.iter_bytes():
+                    body += chunk
+                    if len(body) >= 2 * 1024 * 1024:
+                        break
+                break
+        else:
+            result["error"] = "too many redirects"
+            return result, ""
+        body = body[: 2 * 1024 * 1024]
         result.update(
             http_status=r.status_code,
-            final_url=str(r.url),
+            final_url=str(url),
             content_sha256="0x" + hashlib.sha256(body).hexdigest(),
         )
-        text = r.text
+        text = body.decode("utf-8", "replace")
         title = re.search(r"<title[^>]*>(.*?)</title>", text, re.S | re.I)
-        squash = lambda s: " ".join(html.unescape(s).split())[:300]  # noqa: E731
+        squash = lambda s: " ".join(html.unescape(s).split())  # noqa: E731
         if title:
-            result["page_title"] = squash(title.group(1))
+            result["page_title"] = squash(title.group(1))[:300]
         cited = squash(evidence.get("title") or "").lower()
         result["title_matches"] = bool(cited) and cited in (result["page_title"] or "").lower()
         text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", text, flags=re.S | re.I)
