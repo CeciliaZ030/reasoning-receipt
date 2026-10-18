@@ -356,12 +356,20 @@ impl DynAomiTool for NextAudit {
     type App = RrAuditApp;
     type Args = NextArgs;
     const NAME: &'static str = "rr_next_audit";
-    const DESCRIPTION: &'static str = "Take the oldest oracle trace waiting for audit. Fetches every cited source and returns, per source, what came back (status, content hash, page title) and a text excerpt to judge against what the trace cites it for. A sealed audit waiting for its wallet comes back instead with status sealed.";
-    fn run(_: &RrAuditApp, _: NextArgs, ctx: DynToolCallCtx) -> Result<Value, String> {
+    const DESCRIPTION: &'static str = "Take the oldest oracle trace waiting for audit. Fetches every cited source and returns, per source, what came back (status, content hash, page title) and a text excerpt to judge against what the trace cites it for. A sealed audit waiting for its wallet comes back instead, already staged and simulated, only when no trace is pending.";
+    fn run_with_routes(
+        _: &RrAuditApp,
+        _: NextArgs,
+        ctx: DynToolCallCtx,
+    ) -> Result<ToolReturn, String> {
         let d = deployment()?;
         let mut result = request(&ctx, &d, Method::GET, "/v1/audits/next", None)?;
+        if result["status"] == "sealed" {
+            auditor_wallet(&ctx, &d)?;
+            return audit_route(result, &d);
+        }
         if result["status"] != "pending" {
-            return Ok(result);
+            return Ok(ToolReturn::value(result));
         }
         let evidence = result
             .as_object_mut()
@@ -381,7 +389,7 @@ impl DynAomiTool for NextAudit {
                     "check": check, "page_excerpt": excerpt})
             })
             .collect();
-        Ok(result)
+        Ok(ToolReturn::value(result))
     }
 }
 

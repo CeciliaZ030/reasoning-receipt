@@ -19,8 +19,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from dotenv import load_dotenv
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
+from server.audit import MAX_SOURCES
 from server.chain import ChainClient
 from storage.db import Audit as AuditRow
 from storage.db import Receipt as ReceiptRow
@@ -165,7 +166,8 @@ class AgentLoop:
                     session.execute(
                         select(AuditRow.market_id).where(
                             AuditRow.market_id.in_(ids),
-                            AuditRow.created_at >= cutoff,
+                            # An open audit holds its market until it is published or rejected.
+                            or_(AuditRow.status.in_(("pending", "sealed")), AuditRow.created_at >= cutoff),
                         )
                     ).scalars()
                 )
@@ -288,6 +290,14 @@ class AgentLoop:
         # checks the cited evidence, then the trace is sealed with its findings
         # and published from the auditor's wallet (server/audit.py).
         if os.getenv("RR_AUDIT_MODE", "").lower() == "aomi":
+            cited = sum(len(stance.evidence) for stance in trace_v3.stances)
+            if cited > MAX_SOURCES:
+                logger.warning(
+                    "loop[v3]: %s cites %d sources, more than one audit can report; not emitting",
+                    candidate.market_id,
+                    cited,
+                )
+                return
             with Session() as session:
                 session.add(
                     AuditRow(

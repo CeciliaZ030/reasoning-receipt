@@ -47,6 +47,8 @@ from .chain import ZERO_ADDRESS, _hex_to_bytes32, _market_id_bytes32, _scale_uni
 router = APIRouter(prefix="/v1/audits", tags=["audits"])
 
 AUDIT_VERSION = "aomi-audit/1"
+# The most cited sources one audit can report; the loop never hands off a larger trace.
+MAX_SOURCES = 64
 ADDRESS = re.compile(r"^0x[0-9a-fA-F]{40}$")
 TX_HASH = re.compile(r"^0x[0-9a-fA-F]{64}$")
 PUBLISH_V2_TYPES = ["address", "bytes32", "uint32", "uint32", "bytes32", "bytes32", "bytes16", "string"]
@@ -85,7 +87,7 @@ class SealRequest(BaseModel):
     chain_id: int
     verdict: Literal["approved", "rejected"]
     notes: str = Field(default="", max_length=1000)
-    sources: list[SourceCheck] = Field(max_length=64)
+    sources: list[SourceCheck] = Field(max_length=MAX_SOURCES)
 
 
 class PublishedRequest(BaseModel):
@@ -156,9 +158,12 @@ def next_audit(authorization: str | None = Header(default=None)) -> dict[str, An
     """The oldest trace waiting for the auditor, or a sealed one waiting for its wallet."""
     d = _deployment(authorization)
     with Session() as s:
-        row = s.scalars(
-            select(AuditRow).where(AuditRow.status.in_(("pending", "sealed"))).order_by(AuditRow.id)
-        ).first()
+        # Pending traces first, so a seal waiting on its wallet never blocks newer audits.
+        row = s.scalars(select(AuditRow).where(AuditRow.status == "pending").order_by(AuditRow.id)).first()
+        row = (
+            row
+            or s.scalars(select(AuditRow).where(AuditRow.status == "sealed").order_by(AuditRow.id)).first()
+        )
         return {"status": "empty"} if row is None else _view(row, d)
 
 

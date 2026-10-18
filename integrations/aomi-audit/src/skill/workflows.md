@@ -1,7 +1,8 @@
 # Take, judge, seal, publish, confirm
 1. Call rr_next_audit. empty: nothing is waiting; stop. sealed: an approved audit is
-   waiting for its wallet. Ask the user whether a transaction was already sent for it;
-   if so, call rr_confirm_published with that hash, otherwise go to step 4.
+   waiting for its wallet and its publish is already staged. Ask the user whether a
+   transaction was already sent for it; if so, call rr_confirm_published with that hash
+   and do not commit, otherwise continue at step 5.
 2. For each source, read check and page_excerpt. A source supports its citation only if
    it was retrieved (2xx status, content hash present) and the excerpt shows what
    cited_for says. A failed fetch, a paywall, a different topic or a page that does not

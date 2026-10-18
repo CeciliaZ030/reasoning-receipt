@@ -4,8 +4,10 @@ their hashes, and one finalized ReceiptV2 from the auditor records one receipt."
 
 from __future__ import annotations
 
+import asyncio
 import json
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -21,7 +23,7 @@ from sqlalchemy import select
 from agent import merkle
 from agent.analyst import MarketCandidate
 from agent.loop import AgentLoop
-from server.audit import PUBLISH_V2_SELECTOR, PUBLISH_V2_TYPES, RECEIPT_V2_TOPIC
+from server.audit import MAX_SOURCES, PUBLISH_V2_SELECTOR, PUBLISH_V2_TYPES, RECEIPT_V2_TOPIC
 from server.audit import router as audit_router
 from server.verify import _find_node_in_trace
 from storage.db import Audit as AuditRow
@@ -356,3 +358,55 @@ def test_a_transaction_cannot_publish_two_audits(chain, handed_off):
     assert confirm().json()["status"] == "published"
     assert confirm(audit_id=2).status_code == 409
     assert len(receipts()) == 1
+
+
+def test_a_seal_waiting_on_its_wallet_never_blocks_newer_audits(chain, handed_off):
+    sealed = seal(findings(handed_off)).json()
+    with Session() as s:
+        s.add(AuditRow(market_id="m-audit-2", trace=json.dumps({**handed_off, "market_id": "m-audit-2"})))
+    pending = client.get("/v1/audits/next", headers=AUTH).json()
+    assert pending["status"] == "pending" and pending["audit_id"] == 2
+    seal(findings(handed_off), audit_id=2)
+    assert client.get("/v1/audits/next", headers=AUTH).json() == sealed
+
+
+def test_an_open_audit_holds_its_market_however_old(monkeypatch):
+    monkeypatch.setenv("RR_USE_ENSEMBLE", "1")
+    monkeypatch.setenv("RR_AUDIT_MODE", "aomi")
+    loop = AgentLoop()
+    candidates = loop.scanner.scan()
+    assert len(candidates) >= 2
+    old = datetime(2020, 1, 1, tzinfo=UTC)
+    with Session() as s:
+        s.add(AuditRow(market_id=candidates[0].market_id, trace="{}", created_at=old))
+        s.add(AuditRow(market_id=candidates[1].market_id, trace="{}", status="rejected", created_at=old))
+    priced: list[str] = []
+    monkeypatch.setattr(loop.scanner, "scan", lambda: candidates)
+    monkeypatch.setattr(loop, "_process_candidate", lambda c: priced.append(c.market_id))
+    loop.config.per_tick = len(candidates)
+    asyncio.run(loop.run_once())
+    assert candidates[0].market_id not in priced
+    assert candidates[1].market_id in priced
+
+
+def test_a_trace_too_large_to_audit_is_not_handed_off(monkeypatch):
+    monkeypatch.setenv("RR_USE_ENSEMBLE", "1")
+    monkeypatch.setenv("RR_AUDIT_MODE", "aomi")
+    loop = AgentLoop()
+    analyse = loop._ensemble.analyse
+
+    def flooded(*args, **kwargs):
+        trace = analyse(*args, **kwargs)
+        source = trace.stances[0].evidence[0]
+        trace.stances[0].evidence = [replace(source, id=f"e_bull_{i}") for i in range(MAX_SOURCES + 1)]
+        return trace
+
+    monkeypatch.setattr(loop._ensemble, "analyse", flooded)
+    loop._process_candidate(
+        MarketCandidate(
+            market_id="m-big", source="polymarket", question="?", end_date=None, liquidity_usd=1.0
+        )
+    )
+    with Session() as s:
+        assert list(s.scalars(select(AuditRow))) == []
+    assert receipts() == []
