@@ -10,6 +10,7 @@ Entry point (`rr-agent`):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -21,6 +22,7 @@ from dotenv import load_dotenv
 from sqlalchemy import select
 
 from server.chain import ChainClient
+from storage.db import Audit as AuditRow
 from storage.db import Receipt as ReceiptRow
 from storage.db import Session, init_db
 from storage.irys import IrysClient
@@ -151,11 +153,19 @@ class AgentLoop:
         if cooldown > 0 and candidates:
             cutoff = datetime.now(UTC) - timedelta(seconds=cooldown)
             with Session() as session:
+                ids = [c.market_id for c in candidates]
                 recently_persisted = set(
                     session.execute(
                         select(ReceiptRow.market_id).where(
-                            ReceiptRow.market_id.in_([c.market_id for c in candidates]),
+                            ReceiptRow.market_id.in_(ids),
                             ReceiptRow.created_at >= cutoff,
+                        )
+                    ).scalars()
+                ) | set(
+                    session.execute(
+                        select(AuditRow.market_id).where(
+                            AuditRow.market_id.in_(ids),
+                            AuditRow.created_at >= cutoff,
                         )
                     ).scalars()
                 )
@@ -272,6 +282,22 @@ class AgentLoop:
                              "exploration_integrity", "methodology")
                  if getattr(trace_v3.critic_audit, d).score < 0.4],
             )
+            return
+
+        # Independent audit: the oracle stops at the raw trace. An Aomi auditor
+        # checks the cited evidence, then the trace is sealed with its findings
+        # and published from the auditor's wallet (server/audit.py).
+        if os.getenv("RR_AUDIT_MODE", "").lower() == "aomi":
+            with Session() as session:
+                session.add(
+                    AuditRow(
+                        market_id=candidate.market_id,
+                        market_question=candidate.question,
+                        market_source=candidate.source,
+                        trace=json.dumps(trace_v3.to_dict(), sort_keys=True, separators=(",", ":")),
+                    )
+                )
+            logger.info("loop[v3]: %s handed to the auditor", candidate.market_id)
             return
 
         upload = self._irys.upload(trace_v3.to_dict())

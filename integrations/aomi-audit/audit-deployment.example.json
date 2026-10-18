@@ -1,0 +1,7 @@
+{
+  "enabled": false,
+  "chain_id": 5042002,
+  "registry": "<RECEIPT_REGISTRY_V2_ADDRESS>",
+  "auditor": "<AUDITOR_WALLET_ADDRESS>",
+  "api_url": "https://api.rrtrace.xyz"
+}
