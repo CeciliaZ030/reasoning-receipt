@@ -240,21 +240,22 @@ def seal_audit(
         raise HTTPException(422, "Report every cited source exactly once, at its cited URL")
 
     # Approval is decided here from the findings, not taken from the verdict alone.
-    # Sources that could not be read (bot walls, rate limits, dead links, timeouts) are skipped
-    # and listed in the verdict; most of the sources that were read must support their citation.
+    # Pages that refused the fetch (bot walls, rate limits, timeouts) say nothing about the
+    # citation and are skipped; a dead link (404/410) counts as a source that does not support.
+    # Most of the sources that were read must support what they are cited for.
     readable = [
         c for c in request.sources if c.http_status and 200 <= c.http_status < 300 and c.content_sha256
     ]
-    readable_ids = {c.evidence_id for c in readable}
-    skipped = [c.evidence_id for c in request.sources if c.evidence_id not in readable_ids]
+    dead = [c for c in request.sources if c.http_status in (404, 410)]
+    counted_ids = {c.evidence_id for c in readable + dead}
+    skipped = [c.evidence_id for c in request.sources if c.evidence_id not in counted_ids]
     supporting = sum(c.supports for c in readable)
+    counted = len(readable) + len(dead)
     reasons = [] if cited else ["the trace cites no sources"]
     if cited and not readable:
         reasons.append("no cited source could be read")
-    elif cited and 2 * supporting <= len(readable):
-        reasons.append(
-            f"only {supporting} of {len(readable)} readable sources support what they are cited for"
-        )
+    elif cited and 2 * supporting <= counted:
+        reasons.append(f"only {supporting} of {counted} readable sources support what they are cited for")
     if request.verdict != "approved":
         reasons.append("auditor rejected the reasoning")
     verdict = "rejected" if reasons else "approved"
