@@ -181,11 +181,11 @@ class Audit(Base):
 
 
 class Settlement(Base):
-    """One wallet-approved transfer linked to one portable reasoning receipt.
+    """One wallet-approved transfer linked to one published audit.
 
-    The source receipt is stored exactly as verified and never rewritten. A
-    successful transfer adds a separate outcome receipt that references it.
-    Unique source hash and transaction hash keep repeated verification from
+    ``source_receipt_hash`` is the audited trace hash and ``source_receipt`` the
+    audit reference as it was when the payment was prepared. A successful
+    transfer adds a separate outcome receipt that references it. Unique source hash and transaction hash keep repeated verification from
     creating a second success record.
     """
 

@@ -94,13 +94,14 @@ POST /v1/audits/{id}/published    # check the finalized ReceiptV2, record the re
 
 ### Settlement through Aomi (disabled by default)
 
-An existing receipt can be settled with one wallet-approved USDC transfer prepared and
-simulated through [Aomi](https://aomi.dev). The verified transfer produces a separate outcome
-receipt that links to the original. Chain, recipient and amount come only from a deployment
+A receipt whose audit passed and was published can be settled with one wallet-approved
+USDC transfer prepared and simulated through [Aomi](https://aomi.dev). Failed or
+inconclusive audits block settlement. The verified transfer produces a separate outcome
+receipt that links to the audited trace. Chain, recipient and amount come only from a deployment
 file; see [integrations/aomi](integrations/aomi/README.md).
 
 ```http
-POST /v1/settlements/prepare  # verify receipt, simulate, return the unsigned transfer
+POST /v1/settlements/prepare  # published audit only; simulate, return the unsigned transfer
 POST /v1/settlements/verify   # check the finalized transfer, issue the linked outcome receipt
 ```
 

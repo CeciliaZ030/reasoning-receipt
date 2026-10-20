@@ -1,11 +1,11 @@
-"""Settlement acceptance: configured transfer only, simulation gate, verified
-finality, and one linked outcome receipt per source receipt."""
+"""Settlement acceptance: published audits only, configured transfer only,
+simulation gate, verified finality, and one linked outcome receipt per audit."""
 
 from __future__ import annotations
 
+import itertools
 import json
 from concurrent.futures import ThreadPoolExecutor
-from copy import deepcopy
 from pathlib import Path
 
 import httpx
@@ -16,9 +16,9 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from protocol.receipt import verify_receipt
-from server.portable import router as portable_router
 from server.settlement import TRANSFER_TOPIC
 from server.settlement import router as settlement_router
+from storage.db import Audit as AuditRow
 from storage.db import Session
 from storage.db import Settlement as SettlementRow
 
@@ -32,7 +32,6 @@ TX = "0x" + "aa" * 32
 OTHER_TX = "0x" + "bb" * 32
 
 app = FastAPI()
-app.include_router(portable_router)
 app.include_router(settlement_router)
 client = TestClient(app)
 
@@ -108,30 +107,41 @@ def chain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         yield fake
 
 
-def source_receipt(subject="agent:pay-reviewer") -> dict:
-    created = client.post(
-        "/v1/receipts",
-        json={
-            "subject": subject,
-            "nodes": [
-                {"id": "intent", "kind": "request", "payload": {"pay": "0.01 USDC"}},
-                {"id": "decision", "kind": "outcome", "payload": {"approved": True}},
-            ],
-        },
-    ).json()
-    created.pop("receipt_hash")
-    return created
+_serial = itertools.count(1)
 
 
-def prepare(receipt: dict, **overrides):
-    body = {"receipt": receipt, "execution_account": PAYER, "chain_id": CHAIN, **overrides}
+def audit(status: str = "published") -> int:
+    """Store one audit in ``status``; only ``published`` ones went on chain."""
+    n = next(_serial)
+    done = status == "published"
+    with Session() as s:
+        row = AuditRow(
+            market_id=f"market-{n}",
+            status=status,
+            trace="{}",
+            auditor="0x" + "77" * 20,
+            chain_id=CHAIN,
+            registry="0x" + "88" * 20,
+            trace_hash="0x" + f"{n:064x}" if status != "pending" else None,
+            merkle_root="0x" + f"{n + 1000:064x}" if status != "pending" else None,
+            trace_cid=f"ar://trace-{n}" if done else None,
+            transaction_hash="0x" + f"{n + 5000:064x}" if done else None,
+            receipt_id=n if done else None,
+        )
+        s.add(row)
+        s.commit()
+        return row.id
+
+
+def prepare(audit_id: int, **overrides):
+    body = {"audit_id": audit_id, "execution_account": PAYER, "chain_id": CHAIN, **overrides}
     return client.post("/v1/settlements/prepare", json=body, headers=AUTH)
 
 
-def verify(receipt_hash: str, tx: str = TX):
+def verify(audit_id: int, tx: str = TX):
     return client.post(
         "/v1/settlements/verify",
-        json={"receipt_hash": receipt_hash, "transaction_hash": tx},
+        json={"audit_id": audit_id, "transaction_hash": tx},
         headers=AUTH,
     )
 
@@ -143,15 +153,17 @@ def settled_rows() -> list[SettlementRow]:
 
 def test_transfers_are_disabled_without_a_configured_deployment(monkeypatch) -> None:
     monkeypatch.delenv("RR_SETTLEMENT_CONFIG", raising=False)
-    assert prepare(source_receipt()).status_code == 503
-    assert verify("0x" + "11" * 32).status_code == 503
+    assert prepare(audit()).status_code == 503
+    assert verify(1).status_code == 503
 
 
 def test_preview_matches_configuration_and_settles_with_a_linked_outcome(chain) -> None:
-    original = source_receipt()
-    pristine = deepcopy(original)
+    audit_id = audit()
+    with Session() as s:
+        published = s.get(AuditRow, audit_id)
+        trace_hash, merkle_root = published.trace_hash, published.merkle_root
 
-    prepared = prepare(original)
+    prepared = prepare(audit_id)
     assert prepared.status_code == 200, prepared.text
     body = prepared.json()
     data = body["transaction"]["data"]
@@ -162,71 +174,78 @@ def test_preview_matches_configuration_and_settles_with_a_linked_outcome(chain) 
     assert (body["recipient"], body["token"], body["chain_id"]) == (RECIPIENT, USDC, CHAIN)
 
     chain.mine(TX)
-    settled = verify(body["receipt_hash"])
+    assert (body["audit_id"], body["trace_hash"]) == (audit_id, trace_hash)
+    settled = verify(audit_id)
     assert settled.status_code == 200, settled.text
     outcome = settled.json()["outcome_receipt"]
     assert settled.json()["status"] == "settled"
     assert verify_receipt({k: v for k, v in outcome.items() if k != "receipt_hash"})
     nodes = {node["id"]: node["payload"] for node in outcome["nodes"]}
-    assert nodes["source"]["receipt_hash"] == body["receipt_hash"]
-    assert nodes["source"]["merkle_root"] == original["merkle_root"]
+    assert nodes["source"]["trace_hash"] == trace_hash
+    assert nodes["source"]["merkle_root"] == merkle_root
+    assert nodes["source"]["audit_id"] == audit_id
     assert nodes["transfer"]["transaction_hash"] == TX
-    assert outcome["receipt_hash"] != body["receipt_hash"]
-
-    # The original is untouched, still verifies, and is stored exactly as verified.
-    assert original == pristine
-    assert verify_receipt(original)
-    with Session() as s:
-        stored = s.scalars(select(SettlementRow)).one()
-        assert json.loads(stored.source_receipt) == pristine
+    assert "audit_published" in nodes["verification"]["checks"]
+    assert outcome["metadata"]["links"]["audited_trace_hash"] == trace_hash
 
 
-def test_failed_simulation_blocks_preparation(chain) -> None:
-    chain.call = {"error": {"code": 3, "message": "execution reverted: transfer amount exceeds balance"}}
-    receipt = source_receipt()
-    response = prepare(receipt)
+@pytest.mark.parametrize("status", ["pending", "sealed", "rejected"])
+def test_failed_or_inconclusive_audits_block_settlement(chain, status) -> None:
+    audit_id = audit(status)
+    response = prepare(audit_id)
     assert response.status_code == 409
     assert "transaction" not in response.json()
-    chain.call = {"result": word(0)}
-    assert prepare(receipt).status_code == 409
+    assert prepare(999_999).status_code == 404
+    chain.mine(TX)
+    assert verify(audit_id).status_code == 404
     with Session() as s:
         assert s.scalars(select(SettlementRow)).first() is None
 
 
-def test_wrong_network_tampered_receipt_and_bad_credentials_are_refused(chain) -> None:
-    receipt = source_receipt()
-    assert prepare(receipt, chain_id=1).status_code == 409
-    tampered = deepcopy(receipt)
-    tampered["nodes"][0]["payload"]["pay"] = "100 USDC"
-    assert prepare(tampered).status_code == 422
+def test_failed_simulation_blocks_preparation(chain) -> None:
+    chain.call = {"error": {"code": 3, "message": "execution reverted: transfer amount exceeds balance"}}
+    audit_id = audit()
+    response = prepare(audit_id)
+    assert response.status_code == 409
+    assert "transaction" not in response.json()
+    chain.call = {"result": word(0)}
+    assert prepare(audit_id).status_code == 409
+    with Session() as s:
+        assert s.scalars(select(SettlementRow)).first() is None
+
+
+def test_wrong_network_and_bad_credentials_are_refused(chain) -> None:
+    audit_id = audit()
+    assert prepare(audit_id, chain_id=1).status_code == 409
     bad = client.post(
         "/v1/settlements/prepare",
-        json={"receipt": receipt, "execution_account": PAYER, "chain_id": CHAIN},
+        json={"audit_id": audit_id, "execution_account": PAYER, "chain_id": CHAIN},
         headers={"Authorization": "Bearer wrong"},
     )
     assert bad.status_code == 401
     chain.chain_id = 1
-    assert prepare(receipt).status_code == 503
+    assert prepare(audit_id).status_code == 503
 
 
 def test_pending_and_reverted_never_become_success(chain) -> None:
-    receipt_hash = prepare(source_receipt()).json()["receipt_hash"]
+    audit_id = audit()
+    assert prepare(audit_id).status_code == 200
 
-    assert verify(receipt_hash).json() == {"status": "pending"}
+    assert verify(audit_id).json() == {"status": "pending"}
     chain.mine(TX, status="0x0", logs=[])
-    assert verify(receipt_hash).json() == {"status": "reverted"}
+    assert verify(audit_id).json() == {"status": "reverted"}
     chain.mine(TX, block=150)
-    assert verify(receipt_hash).json() == {"status": "pending_finality"}
+    assert verify(audit_id).json() == {"status": "pending_finality"}
     assert settled_rows() == []
 
     # A non-canonical block hash is refused, not recorded.
     chain.mine(TX, block=90)
     chain.receipts[TX]["blockHash"] = "0x" + "ff" * 32
-    assert verify(receipt_hash).status_code == 409
+    assert verify(audit_id).status_code == 409
     assert settled_rows() == []
 
     chain.mine(TX, block=90)
-    assert verify(receipt_hash).json()["status"] == "settled"
+    assert verify(audit_id).json()["status"] == "settled"
 
 
 @pytest.mark.parametrize(
@@ -241,27 +260,29 @@ def test_pending_and_reverted_never_become_success(chain) -> None:
     ],
 )
 def test_transaction_must_contain_exactly_the_configured_transfer(chain, logs) -> None:
-    receipt_hash = prepare(source_receipt()).json()["receipt_hash"]
+    audit_id = audit()
+    assert prepare(audit_id).status_code == 200
     chain.mine(TX, logs=logs)
-    assert verify(receipt_hash).status_code == 409
+    assert verify(audit_id).status_code == 409
     assert settled_rows() == []
 
 
 def test_repeated_processing_creates_one_success_record(chain) -> None:
-    receipt = source_receipt()
-    receipt_hash = prepare(receipt).json()["receipt_hash"]
+    audit_id = audit()
+    assert prepare(audit_id).status_code == 200
     chain.mine(TX)
 
     with ThreadPoolExecutor(max_workers=6) as pool:
-        results = list(pool.map(lambda _: verify(receipt_hash), range(6)))
+        results = list(pool.map(lambda _: verify(audit_id), range(6)))
     assert {r.status_code for r in results} == {200}
     assert len({r.json()["outcome_receipt"]["receipt_hash"] for r in results}) == 1
     assert len(settled_rows()) == 1
 
     # Re-preparing, a second transaction, or reusing the hash elsewhere is refused.
-    assert prepare(receipt).status_code == 409
+    assert prepare(audit_id).status_code == 409
     chain.mine(OTHER_TX)
-    assert verify(receipt_hash, OTHER_TX).status_code == 409
-    other_hash = prepare(source_receipt("agent:other")).json()["receipt_hash"]
-    assert verify(other_hash, TX).status_code == 409
+    assert verify(audit_id, OTHER_TX).status_code == 409
+    other = audit()
+    assert prepare(other).status_code == 200
+    assert verify(other, TX).status_code == 409
     assert len(settled_rows()) == 1

@@ -1,11 +1,13 @@
-"""Wallet-approved settlement of a portable receipt, prepared through Aomi.
+"""Wallet-approved settlement of an audited receipt, prepared through Aomi.
 
-Flow: an existing ``reasoning-receipt/1`` envelope -> ``/prepare`` verifies it,
-simulates the configured USDC transfer from the connected wallet and returns
-unsigned calldata -> the Aomi app stages it, the host simulates it and the
+Flow: an audit the independent auditor approved and published on chain (see
+``server.audit``) -> ``/prepare`` refuses anything else, simulates the
+configured USDC transfer from the connected wallet and returns unsigned
+calldata -> the Aomi app stages it, the host simulates it and the
 owner approves it in their wallet -> ``/verify`` checks the finalized chain
 receipt independently and records a separate outcome receipt that links back
-to the untouched original.
+to the audited trace. Pending, sealed, rejected or unknown audits never settle,
+so a failed or inconclusive audit blocks payment.
 
 The chain, token, recipient and amount come only from the deployment JSON in
 ``RR_SETTLEMENT_CONFIG`` (the same file the Aomi app is built from). Without
@@ -29,11 +31,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 
-from protocol.receipt import PortableReceipt, ReceiptNode, verify_receipt
+from protocol.receipt import PortableReceipt, ReceiptNode
+from storage.db import Audit as AuditRow
 from storage.db import Session
 from storage.db import Settlement as SettlementRow
-
-from .portable import _restore_receipt
 
 router = APIRouter(prefix="/v1/settlements", tags=["settlements"])
 
@@ -45,13 +46,13 @@ TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523
 
 
 class PrepareRequest(BaseModel):
-    receipt: dict[str, Any]
+    audit_id: int = Field(gt=0)
     execution_account: str = Field(min_length=42, max_length=42)
     chain_id: int
 
 
 class VerifyRequest(BaseModel):
-    receipt_hash: str = Field(min_length=66, max_length=66)
+    audit_id: int = Field(gt=0)
     transaction_hash: str = Field(min_length=66, max_length=66)
 
 
@@ -100,17 +101,35 @@ def _rpc(method: str, params: list[Any]) -> dict[str, Any]:
 def prepare_settlement(
     request: PrepareRequest, authorization: str | None = Header(default=None)
 ) -> dict[str, Any]:
-    """Verify the source receipt, simulate the exact transfer and return it unsigned."""
+    """Require a published audit, simulate the exact transfer and return it unsigned."""
     d = _deployment(authorization)
     payer = request.execution_account.lower()
     if not ADDRESS.match(payer) or int(payer, 16) == 0:
         raise HTTPException(422, "Connect the paying wallet; no address override is accepted")
     if request.chain_id != d["chain_id"]:
         raise HTTPException(409, "Connected wallet is on the wrong network")
-    if not verify_receipt(request.receipt):
-        raise HTTPException(422, "Receipt commitments do not verify; nothing was prepared")
-    source = _restore_receipt(request.receipt)
-    source_hash = source.receipt_hash()
+    # Audit gate: only a trace the auditor approved and that ``/published``
+    # confirmed on chain can be paid for.
+    with Session() as s:
+        audit = s.get(AuditRow, request.audit_id)
+        if audit is None:
+            raise HTTPException(404, "No audit with this id; nothing was prepared")
+        if audit.status == "rejected":
+            raise HTTPException(409, "The audit rejected this trace; settlement is blocked")
+        if audit.status != "published" or not audit.trace_hash or not audit.transaction_hash:
+            raise HTTPException(409, "This trace has no published audit yet; settlement is blocked")
+        source = {
+            "audit_id": audit.id,
+            "receipt_id": audit.receipt_id,
+            "trace_hash": audit.trace_hash,
+            "merkle_root": audit.merkle_root,
+            "trace_cid": audit.trace_cid,
+            "auditor": audit.auditor,
+            "audit_transaction_hash": audit.transaction_hash,
+            "registry": audit.registry,
+            "chain_id": audit.chain_id,
+        }
+    source_hash = source["trace_hash"].lower()
 
     data = TRANSFER_SELECTOR + d["recipient"][2:].rjust(64, "0") + f"{int(d['amount_units']):064x}"
     if _rpc("eth_chainId", []).get("result") != hex(d["chain_id"]):
@@ -121,8 +140,8 @@ def prepare_settlement(
     if "error" in simulated or int(simulated.get("result") or "0x0", 16) != 1:
         raise HTTPException(409, "Simulation failed; nothing was prepared and nothing may be submitted")
 
-    # Keep the verified envelope exactly as received; it is never rewritten.
-    stored = json.dumps(request.receipt, sort_keys=True, separators=(",", ":"))
+    # Keep the audit reference exactly as it was when the payment was prepared.
+    stored = json.dumps(source, sort_keys=True, separators=(",", ":"))
     with Session() as s:
         row = s.scalars(select(SettlementRow).where(SettlementRow.source_receipt_hash == source_hash)).first()
         if row is not None and row.status == "settled":
@@ -149,9 +168,10 @@ def prepare_settlement(
 
     return {
         "status": "prepared",
-        "receipt_id": source.receipt_id,
-        "receipt_hash": source_hash,
-        "merkle_root": source.merkle_root_hex(),
+        "audit_id": source["audit_id"],
+        "receipt_id": source["receipt_id"],
+        "trace_hash": source_hash,
+        "merkle_root": source["merkle_root"],
         "payer": payer,
         **d,
         "transaction": {"to": d["token"], "chain_id": d["chain_id"], "value": "0", "data": data},
@@ -168,10 +188,14 @@ def verify_settlement(
     ``pending_finality`` and ``reverted`` record nothing.
     """
     d = _deployment(authorization)
-    source_hash, tx_hash = request.receipt_hash.lower(), request.transaction_hash.lower()
-    if not TX_HASH.match(source_hash) or not TX_HASH.match(tx_hash):
-        raise HTTPException(422, "Provide the receipt hash and the wallet's 32-byte transaction hash")
+    tx_hash = request.transaction_hash.lower()
+    if not TX_HASH.match(tx_hash):
+        raise HTTPException(422, "Provide the audit id and the wallet's 32-byte transaction hash")
     with Session() as s:
+        audit = s.get(AuditRow, request.audit_id)
+        if audit is None or audit.status != "published" or not audit.trace_hash:
+            raise HTTPException(404, "No prepared settlement for this receipt")
+        source_hash = audit.trace_hash.lower()
         row = s.scalars(select(SettlementRow).where(SettlementRow.source_receipt_hash == source_hash)).first()
         if row is None:
             raise HTTPException(404, "No prepared settlement for this receipt")
@@ -225,17 +249,12 @@ def verify_settlement(
 
     outcome = PortableReceipt(
         subject=f"settlement:{source_hash}",
-        metadata={"links": {"source_receipt_hash": source_hash}},
+        metadata={"links": {"audited_trace_hash": source_hash, "audit_id": source["audit_id"]}},
         nodes=[
             ReceiptNode(
                 id="source",
                 kind="reference",
-                payload={
-                    "receipt_id": source["receipt_id"],
-                    "receipt_hash": source_hash,
-                    "merkle_root": source["merkle_root"],
-                    "schema_version": source["schema_version"],
-                },
+                payload=source,
             ),
             ReceiptNode(
                 id="transfer",
@@ -258,6 +277,7 @@ def verify_settlement(
                 payload={
                     "finalized_block": int(finalized["number"], 16),
                     "checks": [
+                        "audit_published",
                         "chain_id",
                         "receipt_status",
                         "finality",

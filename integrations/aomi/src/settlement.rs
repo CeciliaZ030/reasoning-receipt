@@ -70,7 +70,9 @@ fn request(ctx: &DynToolCallCtx, d: &Deployment, path: &str, body: Value) -> Res
                 s.as_str(),
                 "Settlement transfers are disabled until a recipient is configured"
                     | "Connected wallet is on the wrong network"
-                    | "Receipt commitments do not verify; nothing was prepared"
+                    | "No audit with this id; nothing was prepared"
+                    | "The audit rejected this trace; settlement is blocked"
+                    | "This trace has no published audit yet; settlement is blocked"
                     | "Simulation failed; nothing was prepared and nothing may be submitted"
                     | "This receipt is already settled; verify its transaction instead of paying again"
                     | "No prepared settlement for this receipt"
@@ -88,7 +90,7 @@ fn request(ctx: &DynToolCallCtx, d: &Deployment, path: &str, body: Value) -> Res
             401 | 403 => "Settlement access denied. Check the app credential.",
             404 => "No prepared settlement was found.",
             409 => "Settlement blocked by its current state. Do not submit another payment.",
-            422 => "Invalid settlement request; do not edit the receipt to work around it.",
+            422 => "Invalid settlement request; do not change the audit to work around it.",
             _ => "Settlement state unavailable. Do not submit a payment.",
         }
         .into());
@@ -101,15 +103,15 @@ fn request(ctx: &DynToolCallCtx, d: &Deployment, path: &str, body: Value) -> Res
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PrepareArgs {
-    /// The complete reasoning-receipt/1 envelope exactly as the user supplied it.
-    pub receipt: Value,
+    /// Id of the audit to pay for. Only an audit the auditor approved and published settles.
+    pub audit_id: u64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct VerifyArgs {
-    /// receipt_hash returned by rr_prepare_settlement.
-    pub receipt_hash: String,
+    /// audit_id that rr_prepare_settlement prepared.
+    pub audit_id: u64,
     /// Actual broadcast hash returned by the connected wallet, never an invented identifier.
     pub transaction_hash: String,
 }
@@ -125,7 +127,7 @@ impl DynAomiTool for PrepareSettlement {
     type App = RrApp;
     type Args = PrepareArgs;
     const NAME: &'static str = "rr_prepare_settlement";
-    const DESCRIPTION: &'static str = "Verify an existing reasoning receipt and prepare the deployment's one unsigned USDC transfer from the connected wallet. The API simulates it first and refuses if it would fail. Stages the exact bytes and simulates them; commit only after explicit wallet approval. Never automatically retry submission.";
+    const DESCRIPTION: &'static str = "Confirm the audit was approved and published on chain, then prepare the deployment's one unsigned USDC transfer from the connected wallet. The API simulates it first and refuses if it would fail. Stages the exact bytes and simulates them; commit only after explicit wallet approval. Never automatically retry submission.";
     fn run_with_routes(
         _: &RrApp,
         args: PrepareArgs,
@@ -148,7 +150,7 @@ impl DynAomiTool for PrepareSettlement {
             &ctx,
             &d,
             "/v1/settlements/prepare",
-            json!({"receipt": args.receipt, "execution_account": payer, "chain_id": d.chain_id}),
+            json!({"audit_id": args.audit_id, "execution_account": payer, "chain_id": d.chain_id}),
         )?;
         settlement_route(result, &d, &payer)
     }
@@ -169,7 +171,7 @@ fn settlement_route(result: Value, d: &Deployment, payer: &str) -> Result<ToolRe
         || !same(&result["recipient"], &d.recipient)
         || result["amount_units"] != d.amount_units
         || !same(&result["payer"], payer)
-        || !result["receipt_hash"].as_str().is_some_and(is_hash)
+        || !result["trace_hash"].as_str().is_some_and(is_hash)
         || tx["chain_id"] != d.chain_id
         || tx["value"] != "0"
         || !same(&tx["to"], &d.token)
@@ -192,12 +194,12 @@ fn settlement_route(result: Value, d: &Deployment, payer: &str) -> Result<ToolRe
     {
         return Err("Transfer preview differs from the encoded transaction; stop.".into());
     }
-    let receipt_hash = result["receipt_hash"]
+    let trace_hash = result["trace_hash"]
         .as_str()
         .unwrap_or_default()
         .to_string();
     let stage = json!({"to": d.token, "data": data, "value": "0",
-        "description": format!("Settle receipt {receipt_hash}: transfer {amount} USDC base units to {recipient} on chain {}", d.chain_id),
+        "description": format!("Settle audited trace {trace_hash}: transfer {amount} USDC base units to {recipient} on chain {}", d.chain_id),
         "kind": "rr_settlement"});
     ToolReturn::route(result)
         .next(|next| {
@@ -221,10 +223,9 @@ impl DynAomiTool for VerifySettlement {
     const NAME: &'static str = "rr_verify_settlement";
     const DESCRIPTION: &'static str = "Independently verify the wallet's finalized transaction against the configured transfer and record the linked outcome receipt. Safe to repeat with the same hash. Only status settled is success; pending, pending_finality and reverted mean no outcome was recorded.";
     fn run(_: &RrApp, args: VerifyArgs, ctx: DynToolCallCtx) -> Result<Value, String> {
-        if !is_hash(&args.receipt_hash) || !is_hash(&args.transaction_hash) {
+        if !is_hash(&args.transaction_hash) {
             return Err(
-                "Provide the prepared receipt_hash and the wallet's 32-byte transaction hash."
-                    .into(),
+                "Provide the prepared audit_id and the wallet's 32-byte transaction hash.".into(),
             );
         }
         let d = deployment()?;
@@ -232,13 +233,12 @@ impl DynAomiTool for VerifySettlement {
             &ctx,
             &d,
             "/v1/settlements/verify",
-            json!({"receipt_hash": args.receipt_hash, "transaction_hash": args.transaction_hash}),
+            json!({"audit_id": args.audit_id, "transaction_hash": args.transaction_hash}),
         )?;
-        let links_back = result["outcome_receipt"]["metadata"]["links"]["source_receipt_hash"]
-            .as_str()
-            .is_some_and(|h| h.eq_ignore_ascii_case(&args.receipt_hash));
+        let links_back =
+            result["outcome_receipt"]["metadata"]["links"]["audit_id"] == json!(args.audit_id);
         if result["status"] == "settled" && !links_back {
-            return Err("Outcome receipt does not link to this receipt; stop.".into());
+            return Err("Outcome receipt does not link to this audit; stop.".into());
         }
         Ok(result)
     }
@@ -269,7 +269,7 @@ mod tests {
         );
         let p = json!({"status": "prepared", "chain_id": 5042002, "token": d.token,
             "recipient": d.recipient, "amount_units": "10000", "payer": format!("0x{}", "33".repeat(20)),
-            "receipt_hash": format!("0x{}", "cd".repeat(32)),
+            "trace_hash": format!("0x{}", "cd".repeat(32)),
             "transaction": {"to": d.token, "chain_id": 5042002, "value": "0", "data": data}});
         (d, p)
     }
@@ -303,7 +303,7 @@ mod tests {
             "recipient",
             "amount_units",
             "payer",
-            "receipt_hash",
+            "trace_hash",
         ] {
             let (d, mut p) = fixture();
             let payer = p["payer"].as_str().unwrap().to_string();
@@ -352,7 +352,7 @@ mod tests {
             let ctx = TestCtxBuilder::new("prepare")
                 .attribute("domain", json!({"evm": {"chain_id": 5042002, "address": format!("0x{}", "33".repeat(20))}}))
                 .build();
-            let refused = run_tool::<PrepareSettlement>(&RrApp, json!({"receipt": {}}), ctx);
+            let refused = run_tool::<PrepareSettlement>(&RrApp, json!({"audit_id": 1}), ctx);
             assert!(refused.is_err());
         }
         #[cfg(settlement_configured)]
@@ -368,7 +368,7 @@ mod tests {
 
     #[test]
     fn payer_comes_only_from_host_context() {
-        let args = json!({"receipt": {}, "execution_account": format!("0x{}", "44".repeat(20))});
+        let args = json!({"audit_id": 1, "execution_account": format!("0x{}", "44".repeat(20))});
         assert!(
             run_tool::<PrepareSettlement>(&RrApp, args, TestCtxBuilder::new("prepare").build())
                 .is_err()

@@ -4,8 +4,9 @@ selector. It does not check transfer arguments. The app decodes the prepared cal
 refuses to stage it unless recipient and amount equal the deployment. The API refuses to
 prepare a transfer whose simulation fails, and the host simulates again after staging.
 Wallet approval is the user's own; prompts are not enforcement.
-The original receipt is never edited. Verification checks the chain id, a successful
+The API, not the model, enforces the audit gate: it prepares nothing unless the audit is
+published, so a failed or inconclusive audit blocks payment. The audited trace is never edited. Verification checks the chain id, a successful
 finalized canonical receipt, and exactly one matching Transfer event from the prepared
-wallet. Each receipt and each transaction hash can settle at most once. A plain ERC-20
+wallet. Each audited trace and each transaction hash can settle at most once. A plain ERC-20
 transfer cannot itself refuse a second payment, so never resubmit after an uncertain
 broadcast: verify the hash you have.

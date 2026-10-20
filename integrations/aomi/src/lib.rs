@@ -1,5 +1,5 @@
 //! ReasoningReceipt settlement on Aomi: pay a deployment-configured recipient
-//! for an existing reasoning receipt and get back a linked outcome receipt.
+//! for an audited reasoning receipt and get back a linked outcome receipt.
 
 mod settlement;
 
@@ -8,13 +8,13 @@ use aomi_sdk::{Secret, dyn_aomi_app};
 #[derive(Clone, Default)]
 pub struct RrApp;
 
-const PREAMBLE: &str = "You help a user settle an existing ReasoningReceipt: a portable, byte-verifiable record of an \
-AI decision (schema reasoning-receipt/1). Settlement is one wallet-approved USDC transfer whose chain, token, recipient \
-and amount are fixed by this app's deployment. After the transfer is independently verified on chain, the API issues a \
-separate outcome receipt that links to the original. The original receipt is never edited.
+const PREAMBLE: &str = "You help a user settle an audited ReasoningReceipt: an oracle trace that the independent \
+auditor approved and published on chain. Settlement is one wallet-approved USDC transfer whose chain, token, recipient \
+and amount are fixed by this app's deployment. A pending, sealed or rejected audit never settles. After the transfer is \
+independently verified on chain, the API issues a separate outcome receipt that links to the audited trace.
 
 Activate reasoning-receipt/settlement to prepare and verify a transfer. Rules you must keep:
-- Pass the user's receipt JSON exactly as given. Never write, repair or re-hash a receipt yourself.
+- Settle only by audit id. Never write, repair or re-hash a receipt yourself, and never work around a blocked audit.
 - Only status settled is success. pending, pending_finality and reverted are not outcomes; say so plainly.
 - A receipt records evidence for a decision; it does not prove the decision was right.";
 
@@ -32,7 +32,7 @@ macro_rules! register_app {
             namespaces = [$($namespace),*],
             skills = [{
                 id: "reasoning-receipt/settlement",
-                description: "Settle an existing reasoning receipt with one wallet-approved USDC transfer and a linked outcome receipt",
+                description: "Settle an audited reasoning receipt with one wallet-approved USDC transfer and a linked outcome receipt",
                 tags: ["receipt", "settlement", "payment"],
                 tools: [settlement::PrepareSettlement, settlement::VerifySettlement],
                 sections: {
