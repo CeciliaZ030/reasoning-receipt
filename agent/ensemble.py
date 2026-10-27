@@ -260,11 +260,14 @@ class Ensemble:
         if self.config.enable_web_search:
             for source in sources:
                 try:
-                    page = httpx.get(source["uri"], follow_redirects=False, timeout=10).headers.get(
-                        "location"
-                    )
+                    resp = httpx.get(source["uri"], follow_redirects=False, timeout=10)
                 except httpx.HTTPError:
                     page = None
+                else:
+                    # A source that is already the page answers 200 with no redirect.
+                    page = resp.headers.get("location") or (
+                        source["uri"] if resp.status_code == 200 else None
+                    )
                 if page and page.startswith("https://"):
                     pages.setdefault(page, source["title"])
             if pages:
@@ -288,16 +291,15 @@ class Ensemble:
         except Exception as exc:  # noqa: BLE001
             logger.warning("ensemble: %s stance unparseable (%s); using mock", role, exc)
             obj = mock_stance(role, candidate)
-        else:
-            if self.config.enable_web_search:
-                cited = obj.get("evidence") or []
-                obj["evidence"] = [e for e in cited if isinstance(e, dict) and e.get("url") in pages]
-                if len(obj["evidence"]) < len(cited):
-                    logger.info(
-                        "ensemble: %s dropped %d ungrounded citations",
-                        role,
-                        len(cited) - len(obj["evidence"]),
-                    )
+        if self.config.enable_web_search:
+            cited = obj.get("evidence") or []
+            obj["evidence"] = [e for e in cited if isinstance(e, dict) and e.get("url") in pages]
+            if len(obj["evidence"]) < len(cited):
+                logger.info(
+                    "ensemble: %s dropped %d ungrounded citations",
+                    role,
+                    len(cited) - len(obj["evidence"]),
+                )
         return stance_from_dict(role, self.config.stance_model, obj)
 
     def _run_supervisor(

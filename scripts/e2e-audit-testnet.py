@@ -278,6 +278,8 @@ async def main() -> None:
         ).json()
         if sealed.get("status") == "sealed":
             break
+        if sealed.get("status") != "rejected":
+            sys.exit(f"seal failed, audit #{audit_id} is still pending: {sealed}")
         step(f"   rejected, nothing published: {sealed.get('reasons') or sealed}")
         pending = api.get("/v1/audits/next", headers=AUTH).json()
         if pending.get("status") != "pending":
