@@ -189,17 +189,24 @@ def judge(question: str, claim: dict, evidence: dict, excerpt: str) -> tuple[boo
 
 def publish(sealed: dict) -> str:
     tx = sealed["transaction"]
-    assert tx["to"].lower() == REGISTRY and tx["chain_id"] == CHAIN_ID and tx["value"] == "0"
+    if tx["to"].lower() != REGISTRY or tx["chain_id"] != CHAIN_ID or tx["value"] != "0":
+        sys.exit("sealed transaction is not a zero-value call to the Arc testnet registry; nothing sent")
     data = tx["data"]
-    assert data.startswith(PUBLISH_V2), "not publishV2"
+    if not data.startswith(PUBLISH_V2):
+        sys.exit("sealed transaction is not publishV2; nothing sent")
     words = abi_decode(
         ["address", "bytes32", "uint32", "uint32", "bytes32", "bytes32", "bytes16", "string"],
         bytes.fromhex(data[10:]),
     )
-    assert words[0] == "0x" + "00" * 20, "unexpected consumer"
-    assert "0x" + words[4].hex() == sealed["trace_hash"], "trace hash differs from the seal"
-    assert "0x" + words[5].hex() == sealed["merkle_root"], "merkle root differs from the seal"
-    assert words[7] == sealed["trace_cid"], "CID differs from the seal"
+    # Explicit checks, not asserts: `python -O` strips asserts, and these gate signing.
+    if words[0] != "0x" + "00" * 20:
+        sys.exit("unexpected consumer in calldata; nothing sent")
+    if "0x" + words[4].hex() != sealed["trace_hash"]:
+        sys.exit("trace hash in calldata differs from the seal; nothing sent")
+    if "0x" + words[5].hex() != sealed["merkle_root"]:
+        sys.exit("merkle root in calldata differs from the seal; nothing sent")
+    if words[7] != sealed["trace_cid"]:
+        sys.exit("CID in calldata differs from the seal; nothing sent")
     step(f"calldata decoded and matches the seal (prob={words[2]} conf={words[3]} cid={words[7]})")
 
     call = {"from": auditor.address, "to": REGISTRY, "data": data, "value": "0x0"}
@@ -231,7 +238,8 @@ def publish(sealed: dict) -> str:
 async def main() -> None:
     init_db()
     step(f"auditor {auditor.address}, registry {REGISTRY}, rpc {RPC}")
-    assert rpc("eth_chainId", [])["result"] == hex(CHAIN_ID), "RPC is not Arc testnet"
+    if rpc("eth_chainId", [])["result"] != hex(CHAIN_ID):
+        sys.exit("RPC is not Arc testnet; nothing run")
 
     pending = api.get("/v1/audits/next", headers=AUTH).json()
     if pending.get("status") == "sealed":
@@ -296,7 +304,8 @@ async def main() -> None:
     again = api.post(
         f"/v1/audits/{sealed['audit_id']}/published", headers=AUTH, json={"transaction_hash": tx_hash}
     ).json()
-    assert again["receipt_id"] == confirmed["receipt_id"], "a repeat confirmation created a second receipt"
+    if again["receipt_id"] != confirmed["receipt_id"]:
+        sys.exit("a repeat confirmation created a second receipt")
 
     receipt_id = confirmed["receipt_id"]
     verified = api.get(f"/verify/{receipt_id}").json()
